@@ -125,17 +125,32 @@ def generate_detailed_list(documents, year_filter=None):
 
     return summary.strip()
 
-# 📌 Procesar la pregunta y generar la respuesta en dos partes
+# 📌 Generar respuesta con Mixtral
+def ask_mistral(question, summary_text):
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+    data = {
+        "inputs": f"Pregunta: {question}\nInformación relevante:\n{summary_text}",
+        "parameters": {"max_new_tokens": 250, "temperature": 0.3}
+    }
+    response = requests.post(f"https://api-inference.huggingface.co/models/{MODEL_NAME}", headers=headers, json=data)
+    return response.json()[0].get("generated_text", "Error en la generación de respuesta.") if response.status_code == 200 else "Error en Hugging Face API"
+
+# 📌 Procesar la pregunta y generar la respuesta en tres partes
 def ask_question(question):
     year = extract_year(question)
     sparql_query = generate_sparql_query(question)
     rdf_results = query_rdf(sparql_query)
     
-    # Generar el resumen en formato de texto y la lista detallada
+    # Generar resumen en formato de texto
     summary_text = generate_summary_text(rdf_results, year)
+    
+    # Generar respuesta con Mixtral basada en el resumen
+    mixtral_response = ask_mistral(question, summary_text)
+    
+    # Generar la lista detallada de documentos
     detailed_list = generate_detailed_list(rdf_results, year)
     
-    return summary_text, detailed_list
+    return summary_text, mixtral_response, detailed_list
 
 # ------------------ Interfaz Streamlit ------------------
 
@@ -155,6 +170,7 @@ pregunta = st.text_area("Escribe tu pregunta:", placeholder="Ejemplo: ¿Qué doc
 # **Botón para consultar**
 if st.button("Buscar"):
     with st.spinner("Buscando información..."):
-        summary_text, detailed_list = ask_question(pregunta)
+        summary_text, mixtral_response, detailed_list = ask_question(pregunta)
         st.markdown(f"### Resumen de los Documentos\n\n{summary_text}")
+        st.markdown(f"### Respuesta Generada con Mixtral\n\n{mixtral_response}")
         st.markdown(f"## Respuesta Detallada\n\n{detailed_list}")
