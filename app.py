@@ -126,7 +126,7 @@ def ask_question(question):
 st.title("Explora documentos históricos utilizando RAG y [Mixtral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)")
 st.markdown(
     """
-    - **Fuente de datos:** [PUCP - Instituto Riva-Agüero](https://datos.pucp.edu.pe/dataset.xhtml?persistentId=hdl:20.500.12534/RFZZNY&version=1.0)  
+    - **Fuente de datos:** [Lima y personajes peruanos, PUCP - Instituto Riva-Agüero](https://datos.pucp.edu.pe/dataset.xhtml?persistentId=hdl:20.500.12534/RFZZNY&version=1.0)  
     - **Realiza consultas en lenguaje natural sobre documentos históricos.**
     """
 )
