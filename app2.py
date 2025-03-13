@@ -1,185 +1,75 @@
+import json
+import faiss
+from sentence_transformers import SentenceTransformer
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.llms import HuggingFacePipeline
+from langchain.chains import RetrievalQA
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+import torch
 import os
-import requests
-import spacy
-import unicodedata
-import streamlit as st
-from dotenv import load_dotenv  
-
-st.set_page_config(page_title="Sistema Documental Histórico", layout="wide")
+from dotenv import load_dotenv
 
 # Cargar variables de entorno
 load_dotenv()
-HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-GRAPHDB_SERVER = "https://f469362ea5c7.ngrok.app/"
-REPO_NAME = "IRA"
-SPARQL_ENDPOINT = f"{GRAPHDB_SERVER}/repositories/{REPO_NAME}"
-MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+HUGGINGFACE_API_KEY = os.getenv("HF_API_TOKEN")
 
-@st.cache_resource
-def load_spacy_model():
-    modelo_es = "es_core_news_sm"
-    if not spacy.util.is_package(modelo_es):
-        os.system(f"python -m spacy download {modelo_es}")
-    return spacy.load(modelo_es)
+# Cargar el JSON-LD con los datos de las lenguas
+json_file_path = "grambank_simple.json"
+with open(json_file_path, "r", encoding="utf-8") as f:
+    json_ld_data = json.load(f)
 
-nlp = load_spacy_model()
+# Filtrar solo las entradas que sean lenguas
+languages = [entry for entry in json_ld_data if isinstance(entry, dict) and "http://purl.org/linguistics#Language" in entry.get("@type", [])]
 
-@st.cache_data(ttl=3600)
-def query_graphdb(sparql_query):
-    params = {"query": sparql_query}
-    headers = {"Accept": "application/sparql-results+json"}
-    try:
-        response = requests.get(SPARQL_ENDPOINT, params=params, headers=headers, timeout=10)
-        return response.json() if response.status_code == 200 else None
-    except Exception as e:
-        st.error(f"Error conectando a GraphDB: {str(e)}")
-        return None
+# Extraer información textual de las lenguas para embeddings
+documents = []
+for entry in languages:
+    label = entry.get("http://www.w3.org/2000/01/rdf-schema#label", [{}])[0].get("@value", "")
+    glottocode = entry.get("http://purl.org/linguistics#glottocode", [{}])[0].get("@value", "")
+    if label:  # Asegurar que el label no esté vacío
+        description = f"Lengua: {label}, Glottocode: {glottocode}"
+        documents.append(description)
 
-def clean_text(text):
-    if not text or not isinstance(text, str):
-        return ""
-    text = unicodedata.normalize("NFKD", text).encode('latin-1', 'ignore').decode('utf-8', 'ignore').strip()
-    replacements = {"Ã¡": "á", "Ã©": "é", "Ã±": "ñ", "Âº": "º"}
-    for wrong, correct in replacements.items():
-        text = text.replace(wrong, correct)
-    return text
+# Inicializar el modelo de embeddings
+embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-def generate_sparql_query(question):
-    base_query = """
-    PREFIX dc: <http://purl.org/dc/elements/1.1/>
-    SELECT ?title ?date ?creator ?subject ?description WHERE {
-        ?doc dc:title ?title .
-        OPTIONAL { ?doc dc:date ?date . }
-        OPTIONAL { ?doc dc:creator ?creator . }
-        OPTIONAL { ?doc dc:subject ?subject . }
-        OPTIONAL { ?doc dc:description ?description . }
-    }
-    ORDER BY DESC(?date) 
-    LIMIT 30
-    """
-    
-    if "más relevantes" in question.lower() or "comunes" in question.lower():
-        return base_query.replace("LIMIT 30", "LIMIT 50")
-    
-    doc = nlp(question.lower())
-    keywords = [ent.text for ent in doc.ents] + [token.lemma_ for token in doc if token.pos_ in ["NOUN", "PROPN"]]
-    
-    if keywords:
-        filters = " || ".join([f'regex(str(?title), "{term}", "i")' for term in set(keywords)])
-        return base_query.replace("WHERE {", f"WHERE {{ FILTER({filters}) ")
-    
-    return base_query
+# Convertir los documentos en embeddings
+vectorstore = FAISS.from_texts(documents, embedding_model)
 
-@st.cache_data(ttl=600)
-def ask_mistral(context):
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    prompt = f"""
-    [INST] Como experto en historia peruana del siglo XIX, genera:
-    1. Un párrafo resumen con los aspectos clave
-    2. Lista de puntos importantes
-    3. Contexto histórico relevante
-    
-    Información a analizar:
-    {context}
-    [/INST]
-    """
-    response = requests.post(
-        f"https://api-inference.huggingface.co/models/{MODEL_NAME}",
-        headers=headers,
-        json={"inputs": prompt, "parameters": {"max_new_tokens": 600}}
-    )
-    if response.status_code == 200:
-        return response.json()[0]['generated_text'].split("[/INST]")[-1].strip()
-    return "Error generando el resumen"
+# Guardar la base de datos FAISS
+faiss_db_path = "quechua_rag.index"
+vectorstore.save_local(faiss_db_path)
 
-def process_question(question):
-    sparql_query = generate_sparql_query(question)
-    graphdb_results = query_graphdb(sparql_query)
-    
-    if not graphdb_results:
-        return "No se encontraron resultados. Intente con otros términos.", ""
-    
-    context = []
-    references = []
-    for result in graphdb_results['results']['bindings'][:15]:
-        title = clean_text(result.get('title', {}).get('value', ''))
-        date = clean_text(result.get('date', {}).get('value', ''))
-        subject = clean_text(result.get('subject', {}).get('value', ''))
-        description = clean_text(result.get('description', {}).get('value', ''))
-        
-        context.append(f"Título: {title}\nFecha: {date}\nTema: {subject}\nDescripción: {description[:200]}...")
-        references.append(f"- {title} ({date}) - {subject}")
-    
-    return ask_mistral("\n\n".join(context)), "\n".join(references)
+# Cargar modelo Mixtral-8x7B-Instruct de Hugging Face con optimización
+model_name = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HUGGINGFACE_API_KEY, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float16,
+    device_map="auto",
+    use_auth_token=HUGGINGFACE_API_KEY,
+    trust_remote_code=True
+)
 
-def generate_suggested_questions():
-    sparql_query = """
-    PREFIX dc: <http://purl.org/dc/elements/1.1/>
-    SELECT DISTINCT ?subject (COUNT(?doc) as ?count) WHERE {
-        ?doc dc:subject ?subject 
-    } GROUP BY ?subject ORDER BY DESC(?count) LIMIT 8
-    """
-    results = query_graphdb(sparql_query)
-    
-    if not results or 'results' not in results:
-        return [
-            "¿Cuáles son los documentos más relevantes?",
-            "¿Qué temas históricos son más comunes?"
-        ]
-    
-    questions = []
-    templates = [
-        "¿Qué información existe sobre {subject}?",
-        "¿Cómo se aborda el tema de {subject}?",
-        "¿Qué documentos mencionan {subject}?",
-        "¿Qué autores escribieron sobre {subject}?"
-    ]
-    
-    for i, item in enumerate(results['results']['bindings']):
-        subject = clean_text(item['subject']['value'])
-        count = item['count']['value']
-        questions.append({
-            "text": templates[i % len(templates)].format(subject=subject),
-            "key": f"q_{hash(subject)}_{i}"
-        })
-        if len(questions) >= 6:
-            break
-            
-    return questions
+# Crear pipeline de generación de texto con optimización
+mixtral_pipeline = pipeline(
+    "text-generation",
+    model=model,
+    tokenizer=tokenizer,
+    max_new_tokens=200,
+    torch_dtype=torch.float16,
+    device_map="auto"
+)
 
-# Interfaz mejorada
-st.title("Análisis de Documentos Históricos")
+# Integrar Mixtral con LangChain
+llm = HuggingFacePipeline(pipeline=mixtral_pipeline)
 
-st.markdown("### Preguntas sugeridas:")
-suggested_questions = generate_suggested_questions()
-cols = st.columns(3)
-for i, q in enumerate(suggested_questions):
-    with cols[i % 3]:
-        st.button(
-            q["text"],
-            key=q["key"],
-            on_click=lambda t=q["text"]: st.session_state.update({"pregunta": t})
-        )
+# Configurar el sistema RAG
+retriever = vectorstore.as_retriever()
+qa_chain = RetrievalQA(llm=llm, retriever=retriever)
 
-pregunta = st.text_input("Escribe tu pregunta:", value=getattr(st.session_state, 'pregunta', ''))
-if st.button("Analizar documentos"):
-    if pregunta:
-        with st.spinner('Buscando y analizando...'):
-            resumen, referencias = process_question(pregunta)
-            
-            st.markdown("## Resumen analítico")
-            st.markdown(f"""
-            <div style='
-                background-color: #f8f9fa;
-                padding: 1.5rem;
-                border-radius: 8px;
-                margin-bottom: 2rem;
-            '>
-            {resumen}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            st.markdown("## Documentos relacionados")
-            st.markdown(referencias)
-    else:
-        st.warning("Por favor ingresa una pregunta")
+# Ejemplo de pregunta
+query = "Describe las lenguas Quechua"
+response = qa_chain.run(query)
+print(response)

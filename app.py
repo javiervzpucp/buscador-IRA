@@ -3,148 +3,140 @@ import requests
 import spacy
 import unicodedata
 import streamlit as st
+import rdflib
+import re
 from dotenv import load_dotenv  
+from rdflib.plugins.sparql import prepareQuery
 
-# Cargar variables de entorno
+# ------------------ Configuración inicial ------------------
 load_dotenv()
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
-GRAPHDB_SERVER = "https://72c5a4103094.ngrok.app/"
-REPO_NAME = "IRA"
-SPARQL_ENDPOINT = f"{GRAPHDB_SERVER}/repositories/{REPO_NAME}"
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+RDF_FILE = "dataset.ttl"
 
-# Cargar modelo spaCy
+# Cargar grafo RDF desde archivo local
+g = rdflib.Graph()
+g.parse(RDF_FILE, format="turtle")
+
+# Cargar modelo spaCy para análisis de texto
 modelo_es = "es_core_news_sm"
 if not spacy.util.is_package(modelo_es):
     os.system(f"python -m spacy download {modelo_es}")
 nlp = spacy.load(modelo_es)
 
-# 📌 Función para consultar GraphDB
-def query_graphdb(sparql_query):
-    params = {"query": sparql_query}
-    headers = {"Accept": "application/sparql-results+json"}
-    response = requests.get(SPARQL_ENDPOINT, params=params, headers=headers)
-    return response.json() if response.status_code == 200 else None
+# 📌 Función para consultar el grafo RDF local con SPARQL
+def query_rdf(sparql_query):
+    try:
+        q = prepareQuery(sparql_query)
+        results = g.query(q)
+        return [{
+            "title": str(row.title),
+            "date": str(row.date) if row.date else "Fecha desconocida",
+            "creator": str(row.creator) if row.creator else "Autor desconocido",
+            "subject": str(row.subject) if row.subject else "Sin tema"
+        } for row in results]
+    except Exception as e:
+        print(f"Error en consulta SPARQL: {e}")
+        return []
 
-# 📌 Función para limpiar caracteres UTF-8 mal codificados
+# 📌 Función para limpiar caracteres mal codificados en UTF-8
 def clean_text(text):
     if not text or not isinstance(text, str):
         return ""
-
     text = unicodedata.normalize("NFKC", text).strip()
-    
-    # Corrección de caracteres mal codificados
     replacements = {
         "Ã¡": "á", "Ã©": "é", "Ã­": "í", "Ã³": "ó", "Ãº": "ú",
         "Ã±": "ñ", "Ã": "Á", "Ã‰": "É", "Ã": "Í", "Ã“": "Ó",
         "Ãš": "Ú", "Ã‘": "Ñ", "â€“": "–", "â€”": "—", "â€œ": "“",
         "â€�": "”", "â€¢": "•", "â€¦": "…", "Âº": "º", "Âª": "ª",
-        "Ã¼": "ü", "Ãœ": "Ü", "Ã€": "À", "Ãˆ": "È", "ÃŒ": "Ì",
-        "Ã’": "Ò", "Ã™": "Ù", "\x93": '"', "\x94": '"',
-        "\x91": "'", "\x92": "'", "\xad": "-", "3n": "ón",
-        "\xada": "á", "Ã\xada": "í", "Ã\xad": "í"
+        "Ã¼": "ü", "Ãœ": "Ü"
     }
-
     for wrong, correct in replacements.items():
         text = text.replace(wrong, correct)
-
     return text
 
 # 📌 Extraer entidades clave de la pregunta
-def extract_entities(question):
-    doc = nlp(question)
-    entities = {"date": None, "creator": None, "subject": None}
-
-    for ent in doc.ents:
-        if ent.label_ == "DATE":
-            entities["date"] = ent.text
-        elif ent.label_ == "PERSON":
-            entities["creator"] = ent.text
-        elif ent.label_ in ["LOC", "GPE", "ORG", "MISC"]:
-            entities["subject"] = ent.text
-
-    return entities
+def extract_year(question):
+    match = re.search(r"\b(1[89]\d{2}|20\d{2})\b", question)
+    return match.group(0) if match else None
 
 # 📌 Generar consulta SPARQL
 def generate_sparql_query(question):
-    entities = extract_entities(question)
-
+    year = extract_year(question)
     sparql_query = """
     PREFIX dc: <http://purl.org/dc/elements/1.1/>
     SELECT ?title ?date ?creator ?subject WHERE {
         ?doc dc:title ?title .
+        OPTIONAL { ?doc dc:date ?date }
+        OPTIONAL { ?doc dc:creator ?creator }
+        OPTIONAL { ?doc dc:subject ?subject }
     """
-
-    if entities["date"]:
-        sparql_query += f'\n        ?doc dc:date ?date . FILTER(CONTAINS(LCASE(?date), "{entities["date"].lower()}")) .'
-    if entities["creator"]:
-        sparql_query += f'\n        ?doc dc:creator ?creator . FILTER(CONTAINS(LCASE(?creator), "{entities["creator"].lower()}")) .'
-    if entities["subject"]:
-        sparql_query += f'\n        ?doc dc:subject ?subject . FILTER(CONTAINS(LCASE(?subject), "{entities["subject"].lower()}")) .'
-
-    sparql_query += "\n    } LIMIT 20"
+    if year:
+        sparql_query += f'\n    FILTER(?date = "{year}"^^<http://www.w3.org/2001/XMLSchema#gYear>)'
     
+    sparql_query += "\n} LIMIT 20"
     return sparql_query.strip()
 
-# 📌 Resumir documentos obtenidos de GraphDB
-def summarize_documents(documents):
+# 📌 Resumir documentos obtenidos del grafo RDF
+def summarize_documents(documents, year_filter=None):
     if not documents:
-        return "No se encontraron documentos relevantes en la base de datos."
+        return f"**No se encontraron documentos para el año {year_filter}.**"
 
-    grouped_by_subject = {}
+    summary = f"## Documentos del año {year_filter}\n\n"
+    grouped_docs = {}
+
     for doc in documents:
-        title = clean_text(doc.get("title", {}).get("value", "Título desconocido"))
-        subject = clean_text(doc.get("subject", {}).get("value", "Sin tema"))
-        date = clean_text(doc.get("date", {}).get("value", "Fecha desconocida"))
-        creator = clean_text(doc.get("creator", {}).get("value", "Autor desconocido"))
+        title = clean_text(doc["title"])
+        subject = clean_text(doc["subject"])
+        date = clean_text(doc["date"])
+        creator = clean_text(doc["creator"])
 
-        if subject not in grouped_by_subject:
-            grouped_by_subject[subject] = set()
-        grouped_by_subject[subject].add(f"{title} ({date}) - Autor: {creator}")
+        # Agrupar por tema
+        if subject not in grouped_docs:
+            grouped_docs[subject] = []
+        grouped_docs[subject].append(f"- **{title}** ({date}) - Autor: {creator}")
 
-    # 📌 Generar un resumen estructurado
-    summary = "Aquí tienes un resumen de los documentos encontrados:\n\n"
-    for subject, titles in grouped_by_subject.items():
-        summary += f"📌 **{subject}**:\n"
-        for title in sorted(titles)[:5]:  # Mostrar solo los primeros 5 de cada tema
-            summary += f"- {title}\n"
-        summary += "\n"
+    # Construir el resumen ordenado por tema
+    for subject, docs in grouped_docs.items():
+        summary += f"### {subject}\n" + "\n".join(docs) + "\n\n"
 
     return summary.strip()
 
-# 📌 Consultar Hugging Face API con Mistral
+# 📌 Consultar Hugging Face API con Mixtral
 def ask_mistral(question, context):
     headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
     data = {
         "inputs": f"Pregunta: {question}\nInformación relevante:\n{context}",
         "parameters": {"max_new_tokens": 250, "temperature": 0.3}
     }
-
     response = requests.post(f"https://api-inference.huggingface.co/models/{MODEL_NAME}", headers=headers, json=data)
-    
-    if response.status_code == 200:
-        result = response.json()
-        if isinstance(result, list) and "generated_text" in result[0]:
-            return result[0]['generated_text']
-        return "⚠️ Respuesta inesperada del modelo."
-    
-    return "⚠️ Error en Hugging Face API"
+    return response.json()[0].get("generated_text", "Error en la generación de respuesta.") if response.status_code == 200 else "Error en Hugging Face API"
 
 # 📌 Procesar la pregunta y generar la respuesta
 def ask_question(question):
+    year = extract_year(question)
     sparql_query = generate_sparql_query(question)
-    graphdb_results = query_graphdb(sparql_query)
-
-    # Convertir resultados en un solo párrafo estructurado
-    context = summarize_documents(graphdb_results["results"]["bindings"]) if graphdb_results else "No hay información disponible."
-
+    rdf_results = query_rdf(sparql_query)
+    context = summarize_documents(rdf_results, year) if rdf_results else "**No hay información disponible.**"
     return ask_mistral(question, context)
 
-# 📌 Interfaz en Streamlit
-st.title("RAG con GraphDB y Mixtral")
-st.markdown("🔎 **Pregunta sobre los [documentos almacenados](https://www.ontotext.com/products/graphdb/) y obtén respuestas con [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1).**")
+# ------------------ Interfaz Streamlit ------------------
 
-pregunta = st.text_area("Pregunta", placeholder="Ejemplo: ¿Qué documentos son de Lima?")
-if st.button("🔎 Consultar"):
-    respuesta = ask_question(pregunta)
-    st.text_area("Respuesta", respuesta, height=300)
+# **Encabezado con descripción**
+st.title("Explora documentos históricos utilizando RAG y [Mixtral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)")
+st.markdown(
+    """
+    - **Fuente de datos:** [PUCP - Instituto Riva-Agüero](https://datos.pucp.edu.pe/dataset.xhtml?persistentId=hdl:20.500.12534/RFZZNY&version=1.0)  
+    - **Realiza consultas en lenguaje natural sobre documentos históricos.**
+    """
+)
+
+# **Campo de pregunta**
+pregunta = st.text_area("Escribe tu pregunta:", placeholder="Ejemplo: ¿Qué documentos son de 1906?")
+
+# **Botón para consultar**
+if st.button("Buscar"):
+    with st.spinner("Buscando información..."):
+        respuesta = ask_question(pregunta)
+        # **Mostrar respuesta en Markdown**
+        st.markdown(f"## Respuesta Generada\n\n{respuesta}")
