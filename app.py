@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import spacy
 import unicodedata
@@ -13,16 +14,25 @@ load_dotenv()
 HF_API_TOKEN = os.getenv("HF_API_TOKEN")
 MODEL_NAME = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 RDF_FILE = "dataset.ttl"
+METADATA_FILE = "metadata.json"
 
 # Cargar grafo RDF desde archivo local
 g = rdflib.Graph()
 g.parse(RDF_FILE, format="turtle")
 
-# Cargar modelo spaCy para análisis de texto
-modelo_es = "es_core_news_sm"
-if not spacy.util.is_package(modelo_es):
-    os.system(f"python -m spacy download {modelo_es}")
-nlp = spacy.load(modelo_es)
+# Cargar metadatos del JSON
+with open(METADATA_FILE, "r", encoding="utf-8") as f:
+    metadata = json.load(f)
+
+# 📌 Extraer categorías clave del JSON
+def get_relevant_categories():
+    citation_fields = metadata["datasetVersion"]["metadataBlocks"]["citation"]["fields"]
+    keywords = [
+        kw["keywordValue"]["value"]
+        for field in citation_fields if field["typeName"] == "keyword"
+        for kw in field["value"]
+    ]
+    return keywords if keywords else ["Historia", "Fotografía", "Lima"]
 
 # 📌 Función para consultar el grafo RDF local con SPARQL
 def query_rdf(sparql_query):
@@ -38,22 +48,6 @@ def query_rdf(sparql_query):
     except Exception as e:
         print(f"Error en consulta SPARQL: {e}")
         return []
-
-# 📌 Función para limpiar caracteres mal codificados en UTF-8
-def clean_text(text):
-    if not text or not isinstance(text, str):
-        return ""
-    text = unicodedata.normalize("NFKC", text).strip()
-    replacements = {
-        "Ã¡": "á", "Ã©": "é", "Ã­": "í", "Ã³": "ó", "Ãº": "ú",
-        "Ã±": "ñ", "Ã": "Á", "Ã‰": "É", "Ã": "Í", "Ã“": "Ó",
-        "Ãš": "Ú", "Ã‘": "Ñ", "â€“": "–", "â€”": "—", "â€œ": "“",
-        "â€�": "”", "â€¢": "•", "â€¦": "…", "Âº": "º", "Âª": "ª",
-        "Ã¼": "ü", "Ãœ": "Ü"
-    }
-    for wrong, correct in replacements.items():
-        text = text.replace(wrong, correct)
-    return text
 
 # 📌 Extraer entidades clave de la pregunta
 def extract_year(question):
@@ -77,56 +71,80 @@ def generate_sparql_query(question):
     sparql_query += "\n} LIMIT 20"
     return sparql_query.strip()
 
-# 📌 Resumir documentos obtenidos del grafo RDF
-def summarize_documents(documents, year_filter=None):
+# 📌 Generar un resumen en formato de texto
+def generate_summary_text(documents, year_filter=None):
+    if not documents:
+        return f"No se encontraron documentos para el año {year_filter}."
+
+    categories = get_relevant_categories()
+    summary_text = f"Se han encontrado {len(documents)} documentos correspondientes al año {year_filter}. "
+
+    categorized_docs = {category: 0 for category in categories}
+    uncategorized_count = 0
+
+    for doc in documents:
+        subject = doc["subject"]
+        assigned = False
+        for category in categories:
+            if category.lower() in subject.lower():
+                categorized_docs[category] += 1
+                assigned = True
+                break
+        if not assigned:
+            uncategorized_count += 1
+
+    for category, count in categorized_docs.items():
+        if count > 0:
+            summary_text += f"En la categoría de {category}, se encontraron {count} documentos. "
+
+    if uncategorized_count > 0:
+        summary_text += f"Además, hay {uncategorized_count} documentos sin una categoría específica."
+
+    return summary_text.strip()
+
+# 📌 Generar la lista detallada de documentos sin modificar el formato previo
+def generate_detailed_list(documents, year_filter=None):
     if not documents:
         return f"**No se encontraron documentos para el año {year_filter}.**"
 
-    summary = f"## Documentos del año {year_filter}\n\n"
+    summary = f"## Documentos detallados para el año {year_filter}\n\n"
     grouped_docs = {}
 
     for doc in documents:
-        title = clean_text(doc["title"])
-        subject = clean_text(doc["subject"])
-        date = clean_text(doc["date"])
-        creator = clean_text(doc["creator"])
+        title = doc["title"]
+        subject = doc["subject"]
+        date = doc["date"]
+        creator = doc["creator"]
 
-        # Agrupar por tema
         if subject not in grouped_docs:
             grouped_docs[subject] = []
         grouped_docs[subject].append(f"- **{title}** ({date}) - Autor: {creator}")
 
-    # Construir el resumen ordenado por tema
     for subject, docs in grouped_docs.items():
         summary += f"### {subject}\n" + "\n".join(docs) + "\n\n"
 
     return summary.strip()
 
-# 📌 Consultar Hugging Face API con Mixtral
-def ask_mistral(question, context):
-    headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
-    data = {
-        "inputs": f"Pregunta: {question}\nInformación relevante:\n{context}",
-        "parameters": {"max_new_tokens": 250, "temperature": 0.3}
-    }
-    response = requests.post(f"https://api-inference.huggingface.co/models/{MODEL_NAME}", headers=headers, json=data)
-    return response.json()[0].get("generated_text", "Error en la generación de respuesta.") if response.status_code == 200 else "Error en Hugging Face API"
-
-# 📌 Procesar la pregunta y generar la respuesta
+# 📌 Procesar la pregunta y generar la respuesta en dos partes
 def ask_question(question):
     year = extract_year(question)
     sparql_query = generate_sparql_query(question)
     rdf_results = query_rdf(sparql_query)
-    context = summarize_documents(rdf_results, year) if rdf_results else "**No hay información disponible.**"
-    return ask_mistral(question, context)
+    
+    # Generar el resumen en formato de texto y la lista detallada
+    summary_text = generate_summary_text(rdf_results, year)
+    detailed_list = generate_detailed_list(rdf_results, year)
+    
+    return summary_text, detailed_list
 
 # ------------------ Interfaz Streamlit ------------------
 
 # **Encabezado con descripción**
-st.title("Explora documentos históricos utilizando RAG y [Mixtral](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3)")
+st.title("RAG con RDF y Mixtral")
 st.markdown(
     """
-    - **Fuente de datos:** [Lima y personajes peruanos, PUCP - Instituto Riva-Agüero](https://datos.pucp.edu.pe/dataset.xhtml?persistentId=hdl:20.500.12534/RFZZNY&version=1.0)  
+    **Explora documentos históricos utilizando RDF y [Mixtral](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1)**  
+    - **Fuente de datos:** [PUCP - Instituto Riva-Agüero](https://datos.pucp.edu.pe/dataset.xhtml?persistentId=hdl:20.500.12534/RFZZNY&version=1.0)  
     - **Realiza consultas en lenguaje natural sobre documentos históricos.**
     """
 )
@@ -137,6 +155,6 @@ pregunta = st.text_area("Escribe tu pregunta:", placeholder="Ejemplo: ¿Qué doc
 # **Botón para consultar**
 if st.button("Buscar"):
     with st.spinner("Buscando información..."):
-        respuesta = ask_question(pregunta)
-        # **Mostrar respuesta en Markdown**
-        st.markdown(f"## Respuesta Generada\n\n{respuesta}")
+        summary_text, detailed_list = ask_question(pregunta)
+        st.markdown(f"### Resumen de los Documentos\n\n{summary_text}")
+        st.markdown(f"## Respuesta Detallada\n\n{detailed_list}")
